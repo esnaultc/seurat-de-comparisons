@@ -1,0 +1,234 @@
+---
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+Note: render Rmd from within R, with the environment built from reqs.yaml activated, with:
+
+> rmarkdown::render("tutorial-de.Rmd")
+
+
+# Differential expression with Seurat
+
+
+```{r libraries, results='hide'}
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(tidyr)
+library(DESeq2)
+ifnb <- LoadData("ifnb")
+```
+
+This report is based on the Seurat tutorial for differential expression:
+
+https://satijalab.org/seurat/articles/de_vignette
+
+using the publicly available dataset ``ifnb`` (installed via ``InstallData("ifnb")``.
+
+I wanted to compare the differentially expressed genes (DEG) calculated several ways:
+
+- Seurat genes markers from single cell counts, calculated with ``FindMarkers``
+- Seurat DEG genes from pseudobulk counts, calculated with ``FindMarkers`` after aggregating the counts
+  with ``AggregateExpression``
+- manual aggregation of single cell counts to pseudobulk counts, followed by DESeq2 normalization
+  and differential expression analysis.
+
+
+
+## Metadata table
+
+The ``ifnb`` data does not come with the biological replicate metadata info. It can be downloaded from
+Github, but for the purpose of this tutorial I decided to randomly assign cells to a replicate, for
+simplicity. At least 3 replicates are required for testing in pseudobulk mode.
+
+After pseudobulking, each 'cell' is a condition-rep-celltype pseudobulk profile.
+Idents is automatically set to orig.ident, which is the pseudobulking group.by
+combination of columns.
+
+For DE testing, we want the groups without the rep info.
+
+```{r metadata1, results='asis', cache=TRUE}
+ifnb@meta.data[['de_group']] <- paste0(
+        ifnb@meta.data[['seurat_annotations']],
+        '_',
+        ifnb@meta.data[['stim']])
+```
+
+### Original
+
+```{r, results='asis'}
+metadata.df <- ifnb[[]] %>%
+	as.data.frame() %>%
+	dplyr::select(de_group) %>%
+	table()
+knitr::kable(metadata.df)
+```
+
+### After adding randomly-attributed replicate metadata
+
+
+```{r metadata2, results='asis', cache=TRUE, dependson='metadata1'}
+rand_rep2 <- sample(dim(ifnb[[]])[[1]], dim(ifnb[[]])[[1]]*2/3, replace=FALSE)
+rand_rep3 <- sample(rand_rep2, dim(ifnb[[]])[[1]]/3, replace=FALSE)
+ifnb@meta.data[['sample']] <- 'rep1'
+ifnb@meta.data[['sample']][rand_rep2] <- 'rep2'
+ifnb@meta.data[['sample']][rand_rep3] <- 'rep3'
+metadata.df <- ifnb[[]] %>%
+        as.data.frame() %>%
+        dplyr::select(sample, de_group) %>%
+        table()
+knitr::kable(t(metadata.df))
+```
+
+## Perform DE analysis on single cell counts {.tabset}
+
+By default, ``FindMarkers`` testing is based on the non-parametric Wilcoxon rank sum test.
+Each cell is considered a different sample. We test each cell type for STIM vs. CTRL.
+Default ``slot`` is ``data``.
+
+Active assay is {r ifnb@active.assay}.
+
+```{r sc_de, results='asis', cache=TRUE, dependson='metadata2'}
+# Normalize the data
+ifnb <- NormalizeData(ifnb)
+
+list.sc.de <- list()
+
+# compute markers
+for (sannot in unique(ifnb[[]][['seurat_annotations']])) {
+        list.sc.de[[sannot]] <- FindMarkers(object = ifnb, 
+                         ident.1 = paste0(sannot, "_STIM"), 
+                         ident.2 = paste0(sannot, "_CTRL"),
+                         group.by = 'de_group')
+
+        cat(paste0('\n\n### ', sannot, '\n\n'))
+        print(knitr::kable(head(list.sc.de[[sannot]], n = 15)))
+}
+```
+
+
+
+
+## Perform DE analysis after pseudobulking {.tabset}
+
+To pseudobulk, we use ``AggregateExpression()`` to sum together gene counts of all the cells from the same sample for each cell type. This results in one gene expression profile per sample and cell type. We can then perform DE analysis using DESeq2 on the sample level. This treats the samples, rather than the individual cells, as independent observations.
+
+```{r pseudobulk, cache=TRUE, dependson='sc_de'}
+# pseudobulk the counts based on donor-condition-celltype
+pseudo_ifnb <- AggregateExpression(
+	ifnb,
+	assays = "RNA",
+	return.seurat = T,
+	group.by = c("stim", "sample", "seurat_annotations"))
+
+# the de_group columns was discarded, add it
+pseudo_ifnb@meta.data[['de_group']] <- paste0(
+        pseudo_ifnb@meta.data[['seurat_annotations']],
+        '_',
+        pseudo_ifnb@meta.data[['stim']])
+```
+
+We can perform DE testing on the pseudobulk level with ``FindMarkers``, with the parameters
+``test.use="DESeq2", group.by="de_group"`` where ``de_group`` defines the pseudobulk samples.
+Since ``test.use`` is set to ``DESeq2``, ``slot`` is automatically set to ``counts``.
+
+Active assay is {r pseudo_ifnb@active.assay}.
+
+
+```{r pseudo_de, results='asis', cache=TRUE, dependson='pseudobulk'}
+list.bulk.de <- list()
+
+for (sannot in unique(pseudo_ifnb[[]][['seurat_annotations']])) {
+	list.bulk.de[[sannot]] <- FindMarkers(object = pseudo_ifnb, 
+                         ident.1 = paste0(sannot, "_STIM"), 
+                         ident.2 = paste0(sannot, "_CTRL"),
+                         test.use = "DESeq2",
+			 group.by = 'de_group')
+
+	cat(paste0('\n\n### ', sannot, '\n\n'))
+	print(knitr::kable(head(list.bulk.de[[sannot]], n = 15)))
+}
+
+# clear space
+pseudo_ifnb <- NULL
+```
+
+## Manual pseudobulking and DESeq2 analysis
+
+For comparison purpose, here we do a "quick and dirty" aggregation of counts by replicate
+to generate pseudobulk counts.
+
+```{r manual_pseudo, results='asis', cache=TRUE, dependson='sc_de'}
+# get the raw counts in a dataframe
+active.assay.i <- ifnb@active.assay
+df <- ifnb[[active.assay.i]]$counts 
+
+# get the replicates groups
+ifnb@meta.data[['reps_group']] <- paste0(ifnb[[]][['de_group']], '_', ifnb[[]][['sample']])
+coldata <- ifnb[[]] %>%
+                as.data.frame()
+# clear space
+ifnb <- NULL
+
+# calc the rowSums per replicate, cell type and condition
+pseudo_manual <- lapply(unique(coldata[['reps_group']]), function(x) {
+	cells.i <- coldata %>%
+		dplyr::filter(reps_group == x) %>%
+		rownames(.)
+	return(df[, cells.i] %>% rowSums())
+})
+names(pseudo_manual) <- unique(coldata[['reps_group']])
+
+pseudo_manual <- data.frame(pseudo_manual, check.names=FALSE)
+```
+
+```{r prep_deseq2, results='asis', cache=TRUE, dependson='manual_pseudo'}
+# build sampletable with metadata
+coldata <- coldata %>%
+	dplyr::select(stim, seurat_annotations, sample, de_group, reps_group) %>%
+	unique()
+rownames(coldata) <- coldata[['reps_group']]
+coldata$reps_group <- factor(coldata$reps_group)
+coldata$de_group <- factor(coldata$de_group)
+
+# check the samplenames match
+if (! all(names(pseudo_manual) %in% rownames(coldata))) {
+	stop('Names not matching between pseudo_manual counts and ifnb metadata')
+}
+
+# load count matrix into DESeq2
+dds <- DESeqDataSetFromMatrix(countData = pseudo_manual,
+                              colData = coldata,
+                              design = ~ de_group)
+
+# filter genes with less than 10 total across the samples. Not required, but since I am running this on my
+# tablet (why? out of curiosity, just to see if it was possible), the ressources are limited.
+keep <- rowSums(counts(dds)) > 10
+dds <- dds[keep,]
+
+# estimate size factots, norm counts, perform DE with LFC shrinkage
+dds <- DESeq(dds)
+
+list.manual.de <- list()
+
+for (ct in unique(colData(dds)[['seurat_annotations']])) {
+	list.manual.de[[ct]] <- lfcShrink(
+		dds,
+		contrast=c("de_group", paste0(ct, '_STIM'), paste0(ct, '_CTRL')),
+		type="normal")
+}
+
+```
+
+
+
+
+
+
+
+
+
