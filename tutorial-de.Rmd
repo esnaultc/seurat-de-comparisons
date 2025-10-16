@@ -6,15 +6,14 @@ output:
     toc_float: true
 ---
 
-Note: render Rmd from within R, with the environment built from reqs.yaml activated, with:
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(
+	echo=FALSE,
+	warning=FALSE,
+	message=FALSE)
+```
 
-> rmarkdown::render("tutorial-de.Rmd")
-
-
-# Differential expression with Seurat
-
-
-```{r libraries, results='hide'}
+```{r libraries}
 library(Seurat)
 library(SeuratData)
 library(ggplot2)
@@ -22,6 +21,42 @@ library(tidyr)
 library(DESeq2)
 ifnb <- LoadData("ifnb")
 ```
+
+```{r functions}
+# convert path string to a link upon rendering
+linkify <- function(filepath) {
+	cat(paste0('\n\n [', filepath, '](', filepath, ')\n\n'))
+}
+
+# for debug
+rmd <- function() {
+	rmarkdown::render("tutorial-de.Rmd", envir = globalenv())
+}
+
+degs <- function(res.i, sub.i, lfc_thresh=0, padj_thresh=0.1, sign=1) {
+	res.i %>%
+		dplyr::filter(
+			sign*.data[[paste0('LFC_', sub.i)]] > lfc_thresh,
+			.data[[paste0('padj_', sub.i)]] < padj_thresh
+		) %>%
+	.[['gene']]
+}
+
+```
+
+
+Note: render Rmd from within R, with the environment built from [reqs.yaml](reqs.yaml) activated, with:
+
+> rmarkdown::render("tutorial-de.Rmd")
+
+or from the command line:
+
+> Rscript -e "rmarkdown::render('tutorial-de.Rmd')"
+
+
+
+# Differential expression with Seurat
+
 
 This report is based on the Seurat tutorial for differential expression:
 
@@ -37,9 +72,12 @@ I wanted to compare the differentially expressed genes (DEG) calculated several 
 - manual aggregation of single cell counts to pseudobulk counts, followed by DESeq2 normalization
   and differential expression analysis.
 
+This was also a personal exercice of using Conda environments and rendering Rmds of single cell data
+analysis on my tablet (one of those with built-in Linux development environment capabilities).
+My "other computer" being an HPC system, here I had to be very mindful of ressources.
 
 
-## Metadata table
+## Metadata table {.tabset}
 
 The ``ifnb`` data does not come with the biological replicate metadata info. It can be downloaded from
 Github, but for the purpose of this tutorial I decided to randomly assign cells to a replicate, for
@@ -90,7 +128,7 @@ By default, ``FindMarkers`` testing is based on the non-parametric Wilcoxon rank
 Each cell is considered a different sample. We test each cell type for STIM vs. CTRL.
 Default ``slot`` is ``data``.
 
-Active assay is {r ifnb@active.assay}.
+Active assay is `r ifnb@active.assay`.
 
 ```{r sc_de, results='asis', cache=TRUE, dependson='metadata2'}
 # Normalize the data
@@ -136,7 +174,7 @@ We can perform DE testing on the pseudobulk level with ``FindMarkers``, with the
 ``test.use="DESeq2", group.by="de_group"`` where ``de_group`` defines the pseudobulk samples.
 Since ``test.use`` is set to ``DESeq2``, ``slot`` is automatically set to ``counts``.
 
-Active assay is {r pseudo_ifnb@active.assay}.
+Active assay is `r pseudo_ifnb@active.assay`.
 
 
 ```{r pseudo_de, results='asis', cache=TRUE, dependson='pseudobulk'}
@@ -157,7 +195,7 @@ for (sannot in unique(pseudo_ifnb[[]][['seurat_annotations']])) {
 pseudo_ifnb <- NULL
 ```
 
-## Manual pseudobulking and DESeq2 analysis
+## Manual pseudobulking and DESeq2 analysis {.tabset}
 
 For comparison purpose, here we do a "quick and dirty" aggregation of counts by replicate
 to generate pseudobulk counts.
@@ -210,7 +248,7 @@ dds <- DESeqDataSetFromMatrix(countData = pseudo_manual,
 keep <- rowSums(counts(dds)) > 10
 dds <- dds[keep,]
 
-# estimate size factots, norm counts, perform DE with LFC shrinkage
+# estimate size factors, norm counts, perform DE with LFC shrinkage
 dds <- DESeq(dds)
 
 list.manual.de <- list()
@@ -221,14 +259,89 @@ for (ct in unique(colData(dds)[['seurat_annotations']])) {
 		contrast=c("de_group", paste0(ct, '_STIM'), paste0(ct, '_CTRL')),
 		type="normal")
 }
+```
+
+```{r deseq2_res, results='asis'}
+for (nm in names(list.manual.de)) {
+	cat(paste0('\n\n### ', nm, '\n\n'))
+	print(knitr::kable(
+		list.manual.de[[nm]] %>%
+			as.data.frame() %>%
+			dplyr::arrange(padj, desc(log2FoldChange)) %>%
+			head(15)
+		))
+}
+```
+
+## Summary tables {.tabset}
+
+```{r summary, results='asis'}
+# summarize the number of DEGs for each contrast, with the different approaches
+
+# filtering results from Seurat and DESeq2, with different columns names,
+# so first make a df of all genes with LFC and padj for each approach
+res_list <- list()
+
+res_list[['sc']]<- lapply(list.sc.de, function(x) {
+	x %>%
+		as.data.frame() %>%
+		dplyr::mutate(gene = rownames(.), LFC_sc = avg_log2FC, padj_sc = p_val_adj) %>%
+		dplyr::select(gene, LFC_sc, padj_sc)
+		})
+res_list[['bulk']] <- lapply(list.bulk.de, function(x) {
+	x %>%
+		as.data.frame() %>%
+		dplyr::mutate(gene = rownames(.), LFC_bulk = avg_log2FC, padj_bulk = p_val_adj) %>%
+		dplyr::select(gene, LFC_bulk, padj_bulk)
+		})
+res_list[['manual']] <- lapply(list.manual.de, function(x) {
+	x %>%
+		as.data.frame() %>%
+		dplyr::mutate(gene = rownames(.), LFC_manual = log2FoldChange, padj_manual = padj) %>%
+		dplyr::select(gene, LFC_manual, padj_manual)
+		})
+
+res_list_merged <- lapply(names(res_list[['sc']]), function(nm) {
+	list_i <- lapply(res_list, function(df.i) {df.i[[nm]]})
+	Reduce(function(x, y) merge(x, y, by = "gene", all = TRUE), list_i)
+})
+names(res_list_merged) <- names(res_list[['sc']])
+
+for (nm in names(res_list_merged)) {
+	cat(paste0('\n\n### ', nm, '\n\n'))
+	res.i <- lapply(c('sc', 'bulk', 'manual'), function(x) {
+		c(x, length(degs(res_list_merged[[nm]], x)),
+		  length(degs(res_list_merged[[nm]], x, sign=-1)))
+	})
+	names(res.i) <- c('sc', 'bulk', 'manual')
+	print(knitr::kable(t(as.data.frame(res.i))))
+}
+```
+
+## Scatterplots LFCs {.tabset}
+
+```{r comp_plots, results='asis'}
+for (nm in names(res_list_merged)) {
+	cat(paste0('\n\n### ', nm, '\n\n'))
+
+	p <- ggplot(res_list_merged[[nm]], aes(x=LFC_sc, y=LFC_bulk)) +
+		geom_point() +
+		theme_classic()
+	print(p)
+
+	p <- ggplot(res_list_merged[[nm]], aes(x=LFC_sc, y=LFC_manual)) +
+		geom_point() +
+		theme_classic()
+	print(p)
+
+	p <- ggplot(res_list_merged[[nm]], aes(x=LFC_bulk, y=LFC_manual)) +
+		geom_point() +
+		theme_classic()
+	print(p)
+}
+
 
 ```
 
 
-
-
-
-
-
-
-
+# TO DO: color points by significance padj
