@@ -4,6 +4,7 @@ output:
     code_folding: hide
     toc: true
     toc_float: true
+    filename: 'index.html'
 ---
 
 ```{r global_options, include = FALSE}
@@ -307,34 +308,62 @@ res_list_merged <- lapply(names(res_list[['sc']]), function(nm) {
 })
 names(res_list_merged) <- names(res_list[['sc']])
 
+deg_list <- list()
+
 for (nm in names(res_list_merged)) {
 	cat(paste0('\n\n### ', nm, '\n\n'))
-	res.i <- lapply(c('sc', 'bulk', 'manual'), function(x) {
-		c(x, length(degs(res_list_merged[[nm]], x)),
-		  length(degs(res_list_merged[[nm]], x, sign=-1)))
+	deg_list[[nm]] <- lapply(c('sc', 'bulk', 'manual'), function(x) {
+		list('overexpressed' = degs(res_list_merged[[nm]], x),
+		  'underexpressed' = degs(res_list_merged[[nm]], x, sign=-1))
 	})
-	names(res.i) <- c('sc', 'bulk', 'manual')
-	print(knitr::kable(t(as.data.frame(res.i))))
+	names(deg_list[[nm]]) <- c('sc', 'bulk', 'manual')
+
+	# count and print out table
+	deg_lengths <- lapply(deg_list[[nm]], function(x) {
+				lapply(x, length)
+	})
+		
+	print(knitr::kable(
+		as.data.frame(Reduce(rbind, deg_lengths), row.names=names(deg_lengths)) 
+	))
 }
 ```
 
 ## Scatterplots LFCs {.tabset}
 
+```{r add_sig}
+# add metadata for the significant genes
+for (nm in names(res_list_merged)) {
+	for (appr in c('sc', 'bulk', 'manual')) {
+		sig_degs <- unique(c(deg_list[[nm]][[appr]][['overexpressed']],
+			  deg_list[[nm]][[appr]][['underexpressed']]))
+		res_list_merged[[nm]] <- res_list_merged[[nm]] %>%
+			dplyr::mutate(!!paste0('signif_', appr) := ifelse(gene %in% sig_degs, appr, NA))
+	}
+}
+```
+
 ```{r comp_plots, results='asis'}
 for (nm in names(res_list_merged)) {
 	cat(paste0('\n\n### ', nm, '\n\n'))
 
-	p <- ggplot(res_list_merged[[nm]], aes(x=LFC_sc, y=LFC_bulk)) +
+	p <- ggplot(res_list_merged[[nm]] %>%
+		    	dplyr::mutate(significance = paste0(signif_sc, '-', signif_bulk)),
+	    	aes(x=LFC_sc, y=LFC_bulk, color=significance)) +
 		geom_point() +
 		theme_classic()
 	print(p)
 
-	p <- ggplot(res_list_merged[[nm]], aes(x=LFC_sc, y=LFC_manual)) +
+	p <- ggplot(res_list_merged[[nm]] %>%
+		    	dplyr::mutate(significance = paste0(signif_sc, '-', signif_manual)),
+		aes(x=LFC_sc, y=LFC_manual, color=significance)) +
 		geom_point() +
 		theme_classic()
 	print(p)
 
-	p <- ggplot(res_list_merged[[nm]], aes(x=LFC_bulk, y=LFC_manual)) +
+	p <- ggplot(res_list_merged[[nm]] %>%
+		    	dplyr::mutate(significance = paste0(signif_bulk, '-', signif_manual)),
+		aes(x=LFC_bulk, y=LFC_manual, color=significance)) +
 		geom_point() +
 		theme_classic()
 	print(p)
@@ -344,4 +373,3 @@ for (nm in names(res_list_merged)) {
 ```
 
 
-# TO DO: color points by significance padj
