@@ -1,0 +1,380 @@
+---
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+output_file: 'index.html'
+---
+
+```{r global_options, include = FALSE}
+knitr::opts_chunk$set(
+	echo=FALSE,
+	warning=FALSE,
+	message=FALSE)
+```
+
+```{r libraries}
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(tidyr)
+library(DESeq2)
+ifnb <- LoadData("ifnb")
+```
+
+```{r functions}
+# convert path string to a link upon rendering
+linkify <- function(filepath) {
+	cat(paste0('\n\n [', filepath, '](', filepath, ')\n\n'))
+}
+
+# for debug
+rmd <- function() {
+	rmarkdown::render("tutorial-de.Rmd", envir = globalenv())
+}
+
+degs <- function(res.i, sub.i, lfc_thresh=0, padj_thresh=0.1, sign=1) {
+	res.i %>%
+		dplyr::filter(
+			sign*.data[[paste0('LFC_', sub.i)]] > lfc_thresh,
+			.data[[paste0('padj_', sub.i)]] < padj_thresh
+		) %>%
+	.[['gene']]
+}
+
+```
+
+
+Note: render Rmd from within R, with the environment built from [reqs.yaml](reqs.yaml) activated, with:
+
+> rmarkdown::render('tutorial-de.Rmd', output_file = 'index.html')
+
+or from the command line:
+
+> Rscript -e "rmarkdown::render('tutorial-de.Rmd', output_file = 'index.html')"
+
+
+
+# Differential expression with Seurat
+
+
+This report is based on the Seurat tutorial for differential expression:
+
+https://satijalab.org/seurat/articles/de_vignette
+
+using the publicly available dataset ``ifnb`` (installed via ``InstallData("ifnb")``.
+
+I wanted to compare the differentially expressed genes (DEG) calculated several ways:
+
+- Seurat genes markers from single cell counts, calculated with ``FindMarkers``
+- Seurat DEG genes from pseudobulk counts, calculated with ``FindMarkers`` after aggregating the counts
+  with ``AggregateExpression``
+- manual aggregation of single cell counts to pseudobulk counts, followed by DESeq2 normalization
+  and differential expression analysis.
+
+This was also a personal exercice of using Conda environments and rendering Rmds of single cell data
+analysis on my tablet (one of those with built-in Linux development environment capabilities).
+My "other computer" being an HPC system, here I had to be very mindful of ressources.
+
+
+## Metadata table {.tabset}
+
+The ``ifnb`` data does not come with the biological replicate metadata info. It can be downloaded from
+Github, but for the purpose of this tutorial I decided to randomly assign cells to a replicate, for
+simplicity. At least 3 replicates are required for testing in pseudobulk mode.
+
+After pseudobulking, each 'cell' is a condition-rep-celltype pseudobulk profile.
+Idents is automatically set to orig.ident, which is the pseudobulking group.by
+combination of columns.
+
+For DE testing, we want the groups without the rep info.
+
+```{r metadata1, results='asis', cache=TRUE}
+ifnb@meta.data[['de_group']] <- paste0(
+        ifnb@meta.data[['seurat_annotations']],
+        '_',
+        ifnb@meta.data[['stim']])
+```
+
+### Original
+
+```{r, results='asis'}
+metadata.df <- ifnb[[]] %>%
+	as.data.frame() %>%
+	dplyr::select(de_group) %>%
+	table()
+knitr::kable(metadata.df)
+```
+
+### After adding randomly-attributed replicate metadata
+
+
+```{r metadata2, results='asis', cache=TRUE, dependson='metadata1'}
+rand_rep2 <- sample(dim(ifnb[[]])[[1]], dim(ifnb[[]])[[1]]*2/3, replace=FALSE)
+rand_rep3 <- sample(rand_rep2, dim(ifnb[[]])[[1]]/3, replace=FALSE)
+ifnb@meta.data[['sample']] <- 'rep1'
+ifnb@meta.data[['sample']][rand_rep2] <- 'rep2'
+ifnb@meta.data[['sample']][rand_rep3] <- 'rep3'
+metadata.df <- ifnb[[]] %>%
+        as.data.frame() %>%
+        dplyr::select(sample, de_group) %>%
+        table()
+knitr::kable(t(metadata.df))
+```
+
+## Perform DE analysis on single cell counts {.tabset}
+
+By default, ``FindMarkers`` testing is based on the non-parametric Wilcoxon rank sum test.
+Each cell is considered a different sample. We test each cell type for STIM vs. CTRL.
+Default ``slot`` is ``data``.
+
+Active assay is `r ifnb@active.assay`.
+
+```{r sc_de, results='asis', cache=TRUE, dependson='metadata2'}
+# Normalize the data
+ifnb <- NormalizeData(ifnb)
+
+list.sc.de <- list()
+
+# compute markers
+for (sannot in unique(ifnb[[]][['seurat_annotations']])) {
+        list.sc.de[[sannot]] <- FindMarkers(object = ifnb, 
+                         ident.1 = paste0(sannot, "_STIM"), 
+                         ident.2 = paste0(sannot, "_CTRL"),
+                         group.by = 'de_group')
+
+        cat(paste0('\n\n### ', sannot, '\n\n'))
+        print(knitr::kable(head(list.sc.de[[sannot]], n = 15)))
+}
+```
+
+
+
+
+## Perform DE analysis after pseudobulking {.tabset}
+
+To pseudobulk, we use ``AggregateExpression()`` to sum together gene counts of all the cells from the same sample for each cell type. This results in one gene expression profile per sample and cell type. We can then perform DE analysis using DESeq2 on the sample level. This treats the samples, rather than the individual cells, as independent observations.
+
+```{r pseudobulk, cache=TRUE, dependson='sc_de'}
+# pseudobulk the counts based on donor-condition-celltype
+pseudo_ifnb <- AggregateExpression(
+	ifnb,
+	assays = "RNA",
+	return.seurat = T,
+	group.by = c("stim", "sample", "seurat_annotations"))
+
+# the de_group columns was discarded, add it
+pseudo_ifnb@meta.data[['de_group']] <- paste0(
+        pseudo_ifnb@meta.data[['seurat_annotations']],
+        '_',
+        pseudo_ifnb@meta.data[['stim']])
+```
+
+We can perform DE testing on the pseudobulk level with ``FindMarkers``, with the parameters
+``test.use="DESeq2", group.by="de_group"`` where ``de_group`` defines the pseudobulk samples.
+Since ``test.use`` is set to ``DESeq2``, ``slot`` is automatically set to ``counts``.
+
+Active assay is `r pseudo_ifnb@active.assay`.
+
+
+```{r pseudo_de, results='asis', cache=TRUE, dependson='pseudobulk'}
+list.bulk.de <- list()
+
+for (sannot in unique(pseudo_ifnb[[]][['seurat_annotations']])) {
+	list.bulk.de[[sannot]] <- FindMarkers(object = pseudo_ifnb, 
+                         ident.1 = paste0(sannot, "_STIM"), 
+                         ident.2 = paste0(sannot, "_CTRL"),
+                         test.use = "DESeq2",
+			 group.by = 'de_group')
+
+	cat(paste0('\n\n### ', sannot, '\n\n'))
+	print(knitr::kable(head(list.bulk.de[[sannot]], n = 15)))
+}
+
+# clear space
+pseudo_ifnb <- NULL
+```
+
+## Manual pseudobulking and DESeq2 analysis {.tabset}
+
+For comparison purpose, here we do a "quick and dirty" aggregation of counts by replicate
+to generate pseudobulk counts.
+
+```{r manual_pseudo, results='asis', cache=TRUE, dependson='sc_de'}
+# get the raw counts in a dataframe
+active.assay.i <- ifnb@active.assay
+df <- ifnb[[active.assay.i]]$counts 
+
+# get the replicates groups
+ifnb@meta.data[['reps_group']] <- paste0(ifnb[[]][['de_group']], '_', ifnb[[]][['sample']])
+coldata <- ifnb[[]] %>%
+                as.data.frame()
+# clear space
+ifnb <- NULL
+
+# calc the rowSums per replicate, cell type and condition
+pseudo_manual <- lapply(unique(coldata[['reps_group']]), function(x) {
+	cells.i <- coldata %>%
+		dplyr::filter(reps_group == x) %>%
+		rownames(.)
+	return(df[, cells.i] %>% rowSums())
+})
+names(pseudo_manual) <- unique(coldata[['reps_group']])
+
+pseudo_manual <- data.frame(pseudo_manual, check.names=FALSE)
+```
+
+```{r prep_deseq2, results='asis', cache=TRUE, dependson='manual_pseudo'}
+# build sampletable with metadata
+coldata <- coldata %>%
+	dplyr::select(stim, seurat_annotations, sample, de_group, reps_group) %>%
+	unique()
+rownames(coldata) <- coldata[['reps_group']]
+coldata$reps_group <- factor(coldata$reps_group)
+coldata$de_group <- factor(coldata$de_group)
+
+# check the samplenames match
+if (! all(names(pseudo_manual) %in% rownames(coldata))) {
+	stop('Names not matching between pseudo_manual counts and ifnb metadata')
+}
+
+# load count matrix into DESeq2
+dds <- DESeqDataSetFromMatrix(countData = pseudo_manual,
+                              colData = coldata,
+                              design = ~ de_group)
+
+# filter genes with less than 10 total across the samples. Not required, but since I am running this on my
+# tablet (why? out of curiosity, just to see if it was possible), the ressources are limited.
+keep <- rowSums(counts(dds)) > 10
+dds <- dds[keep,]
+
+# estimate size factors, norm counts, perform DE with LFC shrinkage
+dds <- DESeq(dds)
+
+list.manual.de <- list()
+
+for (ct in unique(colData(dds)[['seurat_annotations']])) {
+	list.manual.de[[ct]] <- lfcShrink(
+		dds,
+		contrast=c("de_group", paste0(ct, '_STIM'), paste0(ct, '_CTRL')),
+		type="normal")
+}
+```
+
+```{r deseq2_res, results='asis'}
+for (nm in names(list.manual.de)) {
+	cat(paste0('\n\n### ', nm, '\n\n'))
+	print(knitr::kable(
+		list.manual.de[[nm]] %>%
+			as.data.frame() %>%
+			dplyr::arrange(padj, desc(log2FoldChange)) %>%
+			head(15)
+		))
+}
+```
+
+## Summary tables {.tabset}
+
+```{r summary, results='asis'}
+# summarize the number of DEGs for each contrast, with the different approaches
+
+# filtering results from Seurat and DESeq2, with different columns names,
+# so first make a df of all genes with LFC and padj for each approach
+res_list <- list()
+
+res_list[['sc']]<- lapply(list.sc.de, function(x) {
+	x %>%
+		as.data.frame() %>%
+		dplyr::mutate(gene = rownames(.), LFC_sc = avg_log2FC, padj_sc = p_val_adj) %>%
+		dplyr::select(gene, LFC_sc, padj_sc)
+		})
+res_list[['bulk']] <- lapply(list.bulk.de, function(x) {
+	x %>%
+		as.data.frame() %>%
+		dplyr::mutate(gene = rownames(.), LFC_bulk = avg_log2FC, padj_bulk = p_val_adj) %>%
+		dplyr::select(gene, LFC_bulk, padj_bulk)
+		})
+res_list[['manual']] <- lapply(list.manual.de, function(x) {
+	x %>%
+		as.data.frame() %>%
+		dplyr::mutate(gene = rownames(.), LFC_manual = log2FoldChange, padj_manual = padj) %>%
+		dplyr::select(gene, LFC_manual, padj_manual)
+		})
+
+res_list_merged <- lapply(names(res_list[['sc']]), function(nm) {
+	list_i <- lapply(res_list, function(df.i) {df.i[[nm]]})
+	Reduce(function(x, y) merge(x, y, by = "gene", all = TRUE), list_i)
+})
+names(res_list_merged) <- names(res_list[['sc']])
+
+deg_list <- list()
+
+for (nm in names(res_list_merged)) {
+	cat(paste0('\n\n### ', nm, '\n\n'))
+	deg_list[[nm]] <- lapply(c('sc', 'bulk', 'manual'), function(x) {
+		list('overexpressed' = degs(res_list_merged[[nm]], x),
+		  'underexpressed' = degs(res_list_merged[[nm]], x, sign=-1))
+	})
+	names(deg_list[[nm]]) <- c('sc', 'bulk', 'manual')
+
+	# count and print out table
+	deg_lengths <- lapply(deg_list[[nm]], function(x) {
+				lapply(x, length)
+	})
+		
+	print(knitr::kable(
+		as.data.frame(Reduce(rbind, deg_lengths), row.names=names(deg_lengths)) 
+	))
+}
+```
+
+## Scatterplots LFCs {.tabset}
+
+```{r add_sig}
+# add metadata for the significant genes
+for (nm in names(res_list_merged)) {
+	for (appr in c('sc', 'bulk', 'manual')) {
+		sig_degs <- unique(c(deg_list[[nm]][[appr]][['overexpressed']],
+			  deg_list[[nm]][[appr]][['underexpressed']]))
+		res_list_merged[[nm]] <- res_list_merged[[nm]] %>%
+			dplyr::mutate(!!paste0('signif_', appr) := ifelse(gene %in% sig_degs, appr, NA))
+	}
+}
+```
+
+```{r comp_plots, results='asis'}
+for (nm in names(res_list_merged)) {
+	cat(paste0('\n\n### ', nm, '\n\n'))
+
+	p <- ggplot(res_list_merged[[nm]] %>%
+		    	dplyr::mutate(significance = paste0(signif_sc, '-', signif_bulk)),
+	    	aes(x=LFC_sc, y=LFC_bulk, color=significance)) +
+		geom_point() +
+		theme_classic()
+	print(p)
+
+	p <- ggplot(res_list_merged[[nm]] %>%
+		    	dplyr::mutate(significance = paste0(signif_sc, '-', signif_manual)),
+		aes(x=LFC_sc, y=LFC_manual, color=significance)) +
+		geom_point() +
+		theme_classic()
+	print(p)
+
+	p <- ggplot(res_list_merged[[nm]] %>%
+		    	dplyr::mutate(significance = paste0(signif_bulk, '-', signif_manual)),
+		aes(x=LFC_bulk, y=LFC_manual, color=significance)) +
+		geom_point() +
+		theme_classic()
+	print(p)
+}
+
+
+```
+
+For simplicity, the same threshold of adjusted p-values of 0.1 was used to label the genes
+as significant for each of the approaches, but they are using different statistical tests 
+(Seurat vs. manual DESeq2), based on different genes background (Seurat vs. manual DESeq2) and
+different number of samples (single cell vs. pseudobulk). Thus it is not surprising that the
+adjusted p-values differ. The LFCs, while not identical, at least are following the same trend.
+

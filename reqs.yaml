@@ -1,0 +1,4 @@
+r-seurat
+bioconda::r-seurat-data
+r-ggplot2
+bioconda::bioconductor-deseq2
