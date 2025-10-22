@@ -4,7 +4,7 @@ output:
     code_folding: hide
     toc: true
     toc_float: true
-    filename: 'index.html'
+output_file: 'index.html'
 ---
 
 ```{r global_options, include = FALSE}
@@ -48,11 +48,11 @@ degs <- function(res.i, sub.i, lfc_thresh=0, padj_thresh=0.1, sign=1) {
 
 Note: render Rmd from within R, with the environment built from [reqs.yaml](reqs.yaml) activated, with:
 
-> rmarkdown::render("tutorial-de.Rmd")
+> rmarkdown::render('tutorial-de.Rmd', output_file = 'index.html')
 
 or from the command line:
 
-> Rscript -e "rmarkdown::render('tutorial-de.Rmd')"
+> Rscript -e "rmarkdown::render('tutorial-de.Rmd', output_file = 'index.html')"
 
 
 
@@ -372,4 +372,9 @@ for (nm in names(res_list_merged)) {
 
 ```
 
+For simplicity, the same threshold of adjusted p-values of 0.1 was used to label the genes
+as significant for each of the approaches, but they are using different statistical tests 
+(Seurat vs. manual DESeq2), based on different genes background (Seurat vs. manual DESeq2) and
+different number of samples (single cell vs. pseudobulk). Thus it is not surprising that the
+adjusted p-values differ. The LFCs, while not identical, at least are following the same trend.
 
